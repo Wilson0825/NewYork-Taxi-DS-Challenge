@@ -1,0 +1,568 @@
+---
+title: "Data Science Challenge"
+author: "Junjie Chu"
+date: "3/22/2018"
+geometry: margin = 2cm
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      fig.show = "hold",
+                      tidy.opts = list(width.cutoff = 80), 
+                      tidy = TRUE)
+```
+
+# Introduction
+Since 2011, the new “apple green” colored cab, which is called Boro taxi, started to appear in New York City. Different from the traditional Yellow cab, these “Green” Taxis can’t pick up passengers in the Manhattan Central Business District and also can’t be hailed by customers in JFK and LGA airports (can only pick up customers from these two airports by calling a car service ahead of time). The Boro Taxis can drop passengers off anywhere, including the Manhattan Central Business District and airports.
+
+In this report, I'm going to analyze the data collected by the New York City Taxi and Limousine commission about "Green" Taxis from September 2015, build statistical models to predict tip percentage, and also explore the potential application of this data. 
+
+The following report includes four major sections. The first part is the preparation done for the analysis. The second part is data exploration, including investigation about trip distance, compare airport trips and non-airport trips. In the third section, I will use statistical models to predict tip as a percentage of the total fare. The fourth section includes one of the research that I did for the potential application of the data which is about the sharing ride. In the last section, I'll list some ideas I haven't realized yet, but worth trying in the future.
+
+# Preparation
+In this session, I'm going to load libraries, set working directory and programmaticaly download the data.
+
+### Load Library
+```{r, message = FALSE, warning = FALSE, echo = TRUE, results = 'hide'}
+library(curl)
+library(data.table)
+library(tidyverse)
+library(scales)
+library(caret)
+library(dummies)
+library(gbm)
+library(liqueueR)
+```
+
+### Set Working Directory
+```{r, message = FALSE, warning = FALSE, echo = TRUE, results = 'hide'}
+setwd('/Users/wilson/Desktop/DSChallenge/')
+```
+
+### Download Data From Website
+```{r, message = FALSE, warning = FALSE, echo = TRUE, results = 'hide'}
+df <- fread('https://s3.amazonaws.com/nyc-tlc/trip+data/green_tripdata_2015-09.csv') # Question 1a
+```
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+print(paste0(nrow(df), " rows and ", ncol(df), " columns have been loaded")) # Question 1b
+```
+
+# Descriptive Analysis
+In this session, I'll do some exploration of data, investigate trip distance, compare airport trips and non-airport trips.
+
+### Histogram of trip distance
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+ggplot(df, aes(x = Trip_distance)) +
+  geom_histogram(binwidth = 0.5) +
+  labs(title = "Histogram of Trip Distance")
+```
+
+The graph above is my first try to plot the histogram of the trip distance. It can't show the pattern of trip distance clearly due to ouliers. By removing outliers, I got the graph below:
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+td_mean <- mean(df$Trip_distance)
+td_sd <- sd(df$Trip_distance)
+ggplot(df, aes(x = Trip_distance)) +
+  geom_histogram(binwidth = 0.5) +
+  coord_cartesian(xlim = c(0, td_mean + 3*td_sd)) +
+  labs(title = "Histogram of Trip Distance (Excluding Outliers)") # Question 2a
+ggsave("Histogram of Trip Distance.png")
+```
+
+From the graph, we can see the Trip Distance is asymmetrically distributed. Here, the graph excludes data which is over 3 times standard deviation away from the mean. It is skewed to the right due to the fact that the Trip Distance can't be a negative number. In addition, median is smaller than the mean.
+
+Therefore, it's reasonable to assume Trip Distance is following a log-normal distribution.
+
+Now, let's prove our assumption
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+df_tripdist <- df %>% filter(Trip_distance > 0) %>% mutate(log_distance = log(Trip_distance))
+ggplot(df_tripdist, aes(x = log_distance)) +
+  geom_histogram(aes(y = ..density.., colour = "log(Trip_distance)"), binwidth = 0.5) +
+  stat_function(fun = dnorm,
+                args = list(mean = mean(df_tripdist$log_distance),
+                            sd = sd(df_tripdist$log_distance)),
+                aes(colour = "Normal Distribution")) +
+  scale_colour_manual(values = c("black", "red")) +
+  labs(title = "Proof of Assumption")
+ggsave("Proof of Assumption.png")
+```
+
+The histogram of log(trip_distance) shows a perfrect fit for normal distribution.
+
+My hypothesis about the data structure is that in NYC, people usually take green taxi for a short ride, like commuting, while few trips are over 10 miles. This could be due to the reason that the public transportation is convenient in NYC, so people won't prefer green taxi for long trips. (Question 2b)
+
+### Trip distance grouped by hour of day.
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+colnames(df)[colnames(df) == 'lpep_pickup_datetime'] = 'Lpep_pickup_datetime'
+df_triphour <- df %>% 
+  mutate(pickup_hour = hour(Lpep_pickup_datetime)) %>% 
+  group_by(pickup_hour) %>% 
+  summarise(mean_distance = mean(Trip_distance),
+            median_distance = median(Trip_distance)) %>% 
+  ungroup()
+
+df_triphour %>% print(n = 24) # Question 3a
+
+df_triphour_gathered <- df_triphour %>% gather(measure, distance, -pickup_hour)
+ggplot(df_triphour_gathered, aes(x = pickup_hour, y = distance, group = measure, colour = measure)) +
+  geom_line() +
+  labs(x = "Pickup Hour", y = "Trip_distance", title = "Distance Summary By Pickup Hour")
+ggsave("Distance Summary By Pickup Hour.png")
+```
+
+The plot above shows a pattern that longer distance trips happens in the early morning or the late evening.
+
+### Airport Trips
+
+NYC area airports include JFK, EWR, and LGA. 
+For each trip, I'm going to identify if the pickup location or dropoff location is near any airport or not.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}
+within_range <- function(long_location, lat_location){
+  # long_location: float
+  # lat_location: float
+  
+  # Derive coordinates from Google
+  long_JFK <- -73.7781
+  lat_JFK <- 40.6413
+  long_EWR <- -74.1745
+  lat_EWR <- 40.6895
+  long_LGA <- -73.8740
+  lat_LGA <- 40.7769
+  
+  # By testing on Googlemap, find radius for each airport which could almost cover the whole airport area.
+  radius_JFK <- 0.015
+  radius_EWR <- 0.008
+  radius_LGA <- 0.015
+  
+  # Identify whether the location is within the searching radius of any airport
+  return ((long_location - long_JFK)^2 + (lat_location - lat_JFK)^2 < radius_JFK^2 |
+            (long_location - long_EWR)^2 + (lat_location - lat_EWR)^2 < radius_EWR^2 |
+            (long_location - long_LGA)^2 + (lat_location - lat_LGA)^2 < radius_LGA^2)
+}
+```
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+df <- df %>% mutate(is_airport = ifelse(within_range(Pickup_longitude, Pickup_latitude) | 
+                                          within_range(Dropoff_longitude, Dropoff_latitude), "Airport", "Non_Airport"))
+df %>%
+  filter(is_airport == "Airport") %>% 
+  summarise(n = n(),
+            mean_fare = mean(Fare_amount),
+            mean_total = mean(Total_amount))
+```
+
+There are 40564 airport related trips, and the avg fare amount is $27.0, and the avg total amount is $32.7. (Question 3b)
+
+In addition, let's compare trip distance, pickup hour, and tolls amount for airport trips and non-airport trips.
+#### Trip Distance
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+df_compare <- df %>% mutate(pickup_hour = hour(Lpep_pickup_datetime))
+ggplot(df_compare, aes(x = Trip_distance, group = is_airport)) +
+  geom_histogram(aes(y = ..density.., fill = is_airport), binwidth = 1) +
+  coord_cartesian(xlim = c(0, 40)) +
+  facet_wrap(~is_airport, nrow = 2) +
+  labs(y = "Percentage Frequency", title = "Trip Distance Comparison")
+ggsave("Trip Distance Comparison.png")
+```
+
+By comparing airport trips with non-airport trips, it's obvious that airport trips are generally longer. The tail of the distribution is much heavier for airport trips. The highest peak of trip distance for airport trips is 3 miles, it could be the tourists living in the hotels nearby.
+
+#### Pickup Hour
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+df_pickup <- df_compare %>% 
+  group_by(is_airport) %>% mutate(n_total = n()) %>% ungroup() %>% 
+  group_by(pickup_hour, is_airport) %>% summarise(n_trip_perc = n()/max(n_total)) %>% ungroup()
+ggplot(df_pickup, aes(x = pickup_hour, y = n_trip_perc, group = is_airport)) +
+  geom_line(aes(colour = is_airport)) +
+  labs(title = "Pickup Hour")
+ggsave("Pickup Hour Comparison.png")
+```
+
+The graph illustrates that the peak hour for airport trips is 3 PM, and 6 PM for non-airport trips. We can also see that there's almost no airport trip at 2 AM, and very few non-airport trips at 5 AM.
+
+#### Toll Amount
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+ggplot(df_compare, aes(x = Tolls_amount, group = is_airport)) +
+  geom_histogram(aes(y = ..density.., fill = is_airport), binwidth = 1) +
+  coord_cartesian(xlim = c(0, 40)) +
+  facet_wrap(~is_airport, nrow = 2) +
+  labs(y = "Percentage Frequency", title = "Tolls Amount Comparison")
+ggsave("Tolls Amount Comparison.png")
+```
+
+The plot shows that most non-airport trips are toll free, and toll fee is applied to near 20% of airport trips.
+
+# Predictive Modeling
+In this session, I'm going to clean the data first by examine each variable, then extract new features based on the current data, finally build different kinds of statistical models to predict tip percentage.
+
+### Data Cleaning
+I'm going to check missing values first, then clean categorical, numerical and timestamp variables separately.
+
+* Step 1. Check missing values
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+n_row <- nrow(df)
+apply(df, 2, function(x){
+  round(sum(is.na(x))/n_row, 3)
+})
+```
+Ehail_fee is 100% missing, so this variable will be completely useless.
+
+* Step 2. Check invalid values
+According to the variable desciption, categorical variables have specific possible values. 
+In addition, as a common sense, Passenger_count and any type of fee amount should be positive.
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+invalid_VendorID <- sum(!df$VendorID %in% c(1, 2))/n_row
+invalid_Store_and_fwd_flag <- sum(!df$Store_and_fwd_flag %in% c("Y", "N"))/n_row
+invalid_RateCodeID <- sum(!df$RateCodeID %in% c(1:6))/n_row
+invalid_Passenger_count <- sum(df$Passenger_count < 0)/n_row
+invalid_Fare_amount <- sum(df$Fare_amount < 0)/n_row
+invalid_Extra <- sum(!df$Extra %in% c(0, 0.5, 1))/n_row
+invalid_MTA_tax <- sum(df$MTA_tax < 0)/n_row
+invalid_Tip_amount <- sum(df$Tip_amount < 0)/n_row
+invalid_Tolls_amount <- sum(df$Tolls_amount < 0)/n_row
+invalid_improvement_surcharge <- sum(!df$improvement_surcharge %in% c(0, 0.3))/n_row
+invalid_Total_amount <- sum(df$Total_amount < 0)/n_row
+invalid_Payment_type <- sum(!df$Payment_type %in% c(1:6))/n_row
+invalid_Trip_type <- sum(!df$Trip_type %in% c(1, 2))/n_row
+
+checks <- c("invalid_VendorID", "invalid_Store_and_fwd_flag", "invalid_RateCodeID", "invalid_Passenger_count",
+            "invalid_Fare_amount", "invalid_Extra", "invalid_MTA_tax", "invalid_Tip_amount", "invalid_Tolls_amount",
+            "invalid_improvement_surcharge", "invalid_Total_amount", "invalid_Payment_type", "invalid_Trip_type")
+invisible(sapply(checks, function(x){
+  col_name <- substr(x, 9, nchar(x))
+  perc <- eval(parse(text = x))
+  print(paste0(col_name, " has ", percent(perc), " invalid value"))
+}))
+```
+
+* Step 3. Deal with invalid values
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+df_clean <- df %>% select(-Ehail_fee) # Make a copy of data, remove variable Ehail_fee
+```
+
+For categorical variables, just replace invalid value with the most frequent value.
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+Mode <- function(x) {
+  u <- unique(x)
+  u[which.max(tabulate(match(x, u)))]
+}
+df_clean$RateCodeID[!df_clean$RateCodeID %in% c(1:6)] <- Mode(df_clean$RateCodeID)
+df_clean$Trip_type[!df_clean$Trip_type %in% c(1,2)] <- Mode(df_clean$Trip_type)
+```
+
+For numerical variables, let's take a look at those negative values first.
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+tbl_df(df %>% 
+  filter(Total_amount < 0) %>% 
+  select(Fare_amount, Total_amount, Tolls_amount, Tip_amount, Extra, MTA_tax, improvement_surcharge))
+```
+There's a pattern that if one of fee variables is negative, other fee variables are also negative.
+
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+table(df$improvement_surcharge)
+```
+For variables like improvement_surcharge, it should only contain value 0.3 or 0, so we have reason to believe, -0.3 should be 0.3 instead. Therefore, we could replace negative values with the absolute value for numeric variables.
+
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+df_clean$Fare_amount <- abs(df_clean$Fare_amount)
+df_clean$Total_amount <- abs(df_clean$Total_amount)
+df_clean$Tolls_amount <- abs(df_clean$Tolls_amount)
+df_clean$Tip_amount <- abs(df_clean$Tip_amount)
+df_clean$Extra <- abs(df_clean$Extra)
+df_clean$MTA_tax <- abs(df_clean$MTA_tax)
+df_clean$improvement_surcharge <- abs(df_clean$improvement_surcharge)
+```
+
+According to the variable description, Tip_amount is only relevant when the trip is paid by credit card.
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+df_clean %>% 
+  group_by(Payment_type) %>% 
+  summarise(mean_Tip_amount = mean(Tip_amount))
+```
+
+For trips not paid by credit card, replace non-zero value for Tip_amount with 0s.
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+df_clean$Tip_amount[df_clean$Payment_type != 1] = 0
+```
+
+Now all numerical variables look fine, except for Extra, which should only contain values 0, 0.5, and 1.
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+table(df_clean$Extra)
+df_clean$Extra[df_clean$Extra > 0 & df_clean$Extra < 1] = 0.5
+df_clean$Extra[df_clean$Extra > 1] = 1
+```
+Here I assign values between 0 and 1 to 0.5, and values larger than 1 to 1.
+
+* Step 4. Change timestamps to correct format
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+df_clean$Lpep_pickup_datetime <- as.POSIXct(df_clean$Lpep_pickup_datetime)
+df_clean$Lpep_dropoff_datetime <- as.POSIXct(df_clean$Lpep_dropoff_datetime)
+```
+
+* Step 5. Build a derived variable for tip as a percentage of the total fare
+As total fare should always be positive, we need to remove 0s from Total_amount.
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+df_clean <- df_clean %>% 
+  filter(Total_amount != 0) %>% 
+  mutate(Tip_perc = Tip_amount/Total_amount) # Question 4a
+```
+
+### Feature Engineering
+In this session, I'm going to derive a new variable Speed, and convert categorical variables to binary ones or dummy variables.
+
+* Create new feature
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+df_clean <- df_clean %>% 
+  mutate(Speed = Trip_distance / as.numeric(difftime(Lpep_dropoff_datetime, Lpep_pickup_datetime, units = "hours")),
+         hour = hour(Lpep_pickup_datetime)) %>% 
+  mutate(Shift = ifelse(hour >= 6 & hour < 12, "morning", 
+                        ifelse(hour >= 12 & hour < 18, "afternoon",
+                               ifelse(hour >= 18, "evening", "other"))))
+```
+
+The motivation for creating variable Speed is that it can somehow reflect customer's degree of satisfication. If Speed is extremely low, then customer will be disappointed, which may lead to a low tip percentage. The motivation for adding Shift is that customer's tipping behaviour could be affected by time of day.
+
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+df_speed_valid <- df_clean[!is.na(df_clean$Speed) & df_clean$Speed >= 1 & df_clean$Speed <= 100,]
+```
+For average speed less than 1 or larger than 100, I recognize them as invalid value.
+
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+ggplot(df_speed_valid, aes(x = Speed)) +
+  geom_histogram(binwidth = 5)
+```
+
+From the graph, it's reasonable to assume that speed is following a lognormal distribution. The following code will replace all invalid values by values sampled from lognormal distribution
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+speed_log_mean <- mean(log(df_speed_valid$Speed))
+speed_log_sd <- sd(log(df_speed_valid$Speed))
+speed_invalid <- df_clean$Speed[is.na(df_clean$Speed) | df_clean$Speed < 1 | df_clean$Speed > 100]
+set.seed(123)
+df_clean$Speed[is.na(df_clean$Speed) | df_clean$Speed < 1 | df_clean$Speed > 100] = rlnorm(n = length(speed_invalid), meanlog = speed_log_mean, sdlog = speed_log_sd)
+```
+
+* Recode categorical variables to binary ones
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+df_clean$VendorID = as.numeric(recode(df_clean$VendorID, `1` = 0, `2` = 1))
+df_clean$Store_and_fwd_flag = as.numeric(recode(df_clean$Store_and_fwd_flag, N = 0, Y = 1))
+df_clean$Trip_type = as.numeric(recode(df_clean$Trip_type, `1` = 0, `2` = 1))
+df_clean$is_airport = as.numeric(recode(df_clean$is_airport, Non_Airport = 0, Airport = 1))
+```
+
+* Create dummy variables
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+RateCodeID_dummy <- dummy(df_clean$RateCodeID, sep = "_")
+Shift_dummy <- dummy(df_clean$Shift, sep = "_")
+df_clean <- cbind(df_clean, RateCodeID_dummy, Shift_dummy)
+colnames(df_clean)[(ncol(df_clean)-9):ncol(df_clean)] <- c(paste0("RateCodeID_", 1:6), "Shift_afternoon", "Shift_evening", "Shift_morning", "Shift_other" )
+```
+
+### Modeling
+From the analysis above, we know that when trip is not paid by credit card or trip distance = 0, we can confidently predict tip percentage to be 0.
+For trips paid by credit card, I'm going to fit differnet models to predict tip percentage step by step. (Question 4b)
+
+* Step 1. Prepare data
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+df_credit <- df_clean %>% 
+  filter(Payment_type == 1, Trip_distance > 0) %>% 
+  select(VendorID, Store_and_fwd_flag, Passenger_count, Trip_distance, Extra, MTA_tax, 
+         Tolls_amount, improvement_surcharge, Trip_type, Speed, is_airport, Tip_perc,
+         RateCodeID_1, RateCodeID_2, RateCodeID_3, RateCodeID_4, RateCodeID_5,
+         Shift_morning, Shift_afternoon, Shift_evening)
+```
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+ggplot(df_credit, aes(x = Tip_perc)) +
+  geom_histogram(aes(y = ..density../100), binwidth = 0.01) +
+  labs(title = "Histogram of Trip Distance")
+Mode(df_credit$Tip_perc)
+```
+
+By taking a look at the response variable, we found 16.67% is the most popular tip percentage, which was applied to over 40% of records 
+
+* Step 2. Split into training and testing set
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+set.seed(123)
+inTraining <- createDataPartition(df_credit$Tip_perc, p = 0.8, list = FALSE)
+df_training <- df_credit[ inTraining,]
+df_testing  <- df_credit[-inTraining,]
+```
+
+* Step 3. Train different models
+
+For baseline model, we can use the constant model that always predict 16.67%
+
+1. Generalized Linear Model
+
+Set seed at each resampling iteration for complete reproducibility
+
+Quote from Rdocument: <https://www.rdocumentation.org/packages/caret/versions/6.0-78/topics/trainControl>
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+set.seed(123)
+seeds <- vector(mode = "list", length = 11)
+for(i in 1:10){
+  seeds[[i]]<- sample.int(1000, 2)
+}
+seeds[[11]]<-sample.int(1000, 1)
+```
+
+Define training control
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+train_control <- trainControl(method = "cv", number = 10, seeds = seeds) # 10-fold cross-validation
+```
+
+Define parameters to tune
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+tuneGrid <- expand.grid(.alpha = c(0, 1), # Tuning alpha for L1 or L2 norm regularization term
+                        .lambda=seq(0, 0.1, by = 0.01)) # Tuning lambda for regularization parameter
+```
+
+Training
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+system.time(glm_model <- train(Tip_perc ~ .,
+                               data = df_training,
+                               trControl = train_control,
+                               tuneGrid = tuneGrid,
+                               method = "glmnet",
+                               family = "gaussian"))
+varImp(glm_model)
+```
+
+From the variable importance graph, we can see top 3 variables are RateCodeID, improvement_surcharge and MTA_tax.
+
+2. Gradient Boosting Model
+Training
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+set.seed(123)
+system.time(gbm_model <- gbm(Tip_perc ~ ., data = df_training, distribution = "gaussian", n.trees = 5000,
+                             shrinkage = 0.01, interaction.depth = 4)) 
+# Parameter tuning not performed because it's too time-consuming
+summary(gbm_model)
+```
+
+From the variable importance graph, we can see top 3 variables chosen by GBM are Trip_distance, Speed, and VendorID, which makes more sense than the ones selected by GLM
+
+* Step 4. Model Evaluation
+Performance on testing set
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+baseline_test_mse <- mean((1/6 - df_testing$Tip_perc)^2)
+baseline_test_mse
+```
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+glm_model$bestTune
+glm_pred <- predict(glm_model, df_testing, .lambda = 0)
+glm_test_mse <- mean((glm_pred - df_testing$Tip_perc)^2)
+glm_test_mse
+```
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+gbm_pred <- predict(gbm_model, df_testing, n.trees = 5000)
+gbm_test_mse <- mean((gbm_pred - df_testing$Tip_perc)^2)
+gbm_test_mse
+```
+
+In terms of MSE (Mean Squared Error), baseline model: 0.00622, GLM: 0.00552, GBM: 0.00546
+GBM is the best model being found.
+The final model is: first identify whether the trip is paid by credit card and trip_distance > 0, if no then predict 0, if yes then use GBM to predict the tip percentage.
+
+# Future Application (Question 5 Option C: Search)
+In order to promote ride sharing, KNN can be implemented to maximize the ride sharing efficiency.
+
+In this session, I'm going to realize the KNN algorithm, analyze the computation complexity, and find the most efficient way of implementation in R.
+
+### KNN based on distance
+First, create a unique ID for each trip
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+df_knn <- df %>% mutate(ID = 1:n())
+```
+
+Here, we can use priority queue to realize the implementation of KNN.
+Basic idea is that for each trip, we calculate the distance to the target location and update the priority queue.
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+k_nearest_pickup2 <- function(df, long_location, lat_location, k){
+  # df: data.frame, at least containing column: ID, Pickup_longitude, Pickup_latitude
+  # long_location: float
+  # lat_location: float
+  
+  df_small <- df %>% select(ID, Pickup_longitude, Pickup_latitude) # Use a small data frame to increase speed.
+  
+  # Create a PriorityQueue
+  queue <- PriorityQueue$new()
+  pb <- txtProgressBar(min = 0, max = nrow(df_small)) # Keep track of progress
+  
+  # Find k nearest neighbors
+  invisible(sapply(1:nrow(df_small), function(i){ # For each row in data
+    id <- df_small$ID[i]
+    long <- df_small$Pickup_longitude[i]
+    lat <- df_small$Pickup_latitude[i]
+    distance <- ((long - long_location)^2 + (lat - lat_location)^2)^0.5 # Calculate distance to the target location
+    
+    if(queue$size() <= k - 1){ # If queue length less than k-1, then push the trip to queue
+      queue$push(id, distance)
+    }else if(distance < queue$priorities[1]){ # If trip distance less than head of queue, pop the current head of the queue, and push the trip to queue
+      queue$pop()
+      queue$push(id, distance)
+    }
+    setTxtProgressBar(pb, i)
+  }))
+  result_id <- unlist(queue$data)
+  df_top_k <- df %>% filter(ID %in% result_id)
+  return(df_top_k)
+}
+```
+
+### KNN based on time for pickup
+This could be achieved by using the similar method as above, by calculating time for pickup instead of distance for each trip. For calculating time for pickup, we could call the Googlemap API to calculate the estimated time between two locations.
+
+### Computational complexity
+
+* Time complexity:
+Assume the time for calculating distance/time for pickup between two locations is O(d), number of rows of data is n,
+we also know the time cost for both push and pop in priority queue is O(logk).
+Therefore the total time cost is O(ndlogk)
+
+* Space complexity:
+Only a priorty queue with length k was created. So space complexity is O(k)
+
+### Alternative implementation
+Here's another version of implementation, which take advantages of an efficient R library called dplyr.
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
+k_nearest_pickup <- function(df, long_location, lat_location, k){
+  # df: data.frame, at least containing column: ID, Pickup_longitude, Pickup_latitude
+  # long_location: float
+  # lat_location: float
+  
+  df_small <- df %>% select(ID, Pickup_longitude, Pickup_latitude) # Use a small data frame to increase speed.
+  # Step 1. Calculate distance between the target location and pickup location of each trip in df
+  df_distances <- df_small %>% mutate(distance = ((Pickup_longitude - long_location)^2 + (Pickup_latitude - lat_location)^2)^0.5)
+  
+  # Step 2. Order trips by distance acendingly and select top k trip
+  df_top_k <- df_distances %>% 
+    arrange(distance) %>% 
+    filter(row_number() <= k) %>%  
+    select(ID) %>% 
+    left_join(df, by = "ID")
+  
+  return(df_top_k)
+}
+```
+
+Comparing running time
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+system.time(testrun <- k_nearest_pickup(df_knn, -73.86177, 40.76826, 10))
+system.time(testrun2 <- k_nearest_pickup2(df_knn, -73.86177, 40.76826, 10))
+```
+
+Proof of equivalence
+```{r, message = TRUE, warning = FALSE, echo = TRUE}
+ordered(testrun$ID) == ordered(testrun$ID)
+```
+
+### Conclusion
+In R, proper dataframe manipulation makes the implementation of KNN 60 times faster than the priority queue approach, even though the latter one theoretically has less time complexity. The major reason might be the inefficiency of iteration in R, compared with high efficiency in vectorized computation utilized by dplyr.
+
+# Future Improvement
+If time allowed, I would do the following improvements:
+1. Create one more variable `region` based on coordinates of pickup location. The assumption is that different region may have different income level. Therefore, tip percentage could be different.
+2. In the modeling part, I would tune parameters for GBM and use cross validation to find the optimal number of trees for prediction.
